@@ -1,0 +1,1971 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WebSocketsServer.h>
+#include <ArduinoJson.h>  
+#include <vector>
+
+
+
+// ===== WIFI CONFIG =====
+const char* ssid = "Duy Hoang";
+const char* password = "086547990104";
+
+// ===== TCP server (PORT 8080) =====
+WiFiServer tcpServer(8080);
+WiFiClient tcpClient;
+
+// ===== WEB server (HTTP port 80) =====
+WebServer web(80);
+
+// ===== WebSocket (port 81) =====
+WebSocketsServer ws(81);
+
+// ===== CHÂN KẾT NỐI =====
+#define IN1 5
+#define IN2 6
+#define ENA 4
+#define IN3 7
+#define IN4 8
+#define ENB 9
+
+#define TRIG_PIN 10
+#define ECHO_PIN 3
+
+// ===== PWM LEDC =====
+const int PWM_FREQ = 20000;
+const int PWM_RES  = 8;
+
+inline void pwmWriteA(int duty) { ledcWrite(ENA, constrain(duty, 0, 255)); }
+inline void pwmWriteB(int duty) { ledcWrite(ENB, constrain(duty, 0, 255)); }
+
+void pwmSetup() {
+  ledcAttach(ENA, PWM_FREQ, PWM_RES);
+  ledcAttach(ENB, PWM_FREQ, PWM_RES);
+}
+
+// ===== CÀI ĐẶT XE =====
+const int SPEED_FORWARD = 60;
+const int SPEED_TURN    = 60;
+const int SPEED_BACKUP  = 50;
+
+// ===== THUẬT TOÁN =====
+const int OBSTACLE_THRESHOLD = 15;  // cm
+
+// ===== BIẾN CẢM BIẾN =====
+int distanceFront = 999;
+int distanceLeft  = 999;
+int distanceRight = 999;
+
+// ===== PERSON DATA =====
+struct PersonData {
+  float x;
+  float y;
+  bool detected;
+};
+PersonData person = {0.0f, 0.0f, false};
+
+unsigned long lastSensorRead = 0;
+unsigned long lastClientCheck = 0;
+unsigned long lastLRms = 0;
+
+// ===== POSE với velocity smoothing =====
+float x = 0.0f, y = 0.0f, th = 0.0f;
+float vx = 0.0f, vy = 0.0f, vth = 0.0f;
+unsigned long lastPoseMs = 0;
+
+const float DEG2RAD = 3.1415926f / 180.0f;
+
+const float V_FWD  = 0.18f;
+const float V_BACK = 0.14f;
+const float W_TURN = 2.00f;
+const float VELOCITY_ALPHA = 0.7f;
+
+const int TURN_DURATION = 800;
+
+const float aF = 0.0f * DEG2RAD;
+const float aL = +90.0f * DEG2RAD;
+const float aR = -90.0f * DEG2RAD;
+
+enum Cmd { CMD_STOP, CMD_FWD, CMD_BACK, CMD_TURN_L, CMD_TURN_R };
+Cmd currentCmd = CMD_STOP;
+
+unsigned long turnStartMs = 0;
+bool isTurning = false;
+
+// ===== Navigation logic =====
+enum State { NORMAL, BACKING, WAITING, COVERAGE };
+State navState = NORMAL;
+unsigned long stateStartMs = 0;
+
+
+// 🆕 THÊM TOÀN BỘ ĐOẠN NÀY
+// ===== PATH HISTORY (Lưu lịch sử đường đi) =====
+struct PathPoint {
+  float x;
+  float y;
+};
+std::vector<PathPoint> pathHistory;
+const float MIN_PATH_DISTANCE = 0.05f;  // 5cm - chỉ lưu khi di chuyển ít nhất 5cm
+const int MAX_PATH_SIZE = 800;  // Giới hạn bộ nhớ
+
+// ===== LOOP DETECTION (Phát hiện vòng kín) =====
+struct LoopDetection {
+  bool completed = false;
+  float closureThreshold = 0.30f;  // Ngưỡng đóng vòng (30cm) - GIẢM TỪ 50cm
+  int minPathLength = 50;          // Số điểm tối thiểu - TĂNG TỪ 20
+  float minTravelDistance = 2.0f;  // 🆕 Phải đi ít nhất 2m
+  int checkInterval = 5;           // Kiểm tra mỗi 5 điểm - TĂNG TỪ 3
+  int skipRecent = 15;             // Bỏ qua 15 điểm gần nhất - TĂNG TỪ 8
+  unsigned long startTime = 0;
+  unsigned long endTime = 0;
+  float loopPerimeter = 0.0f;
+  int loopCloseIndex = -1;
+};  
+
+LoopDetection loopDetector;
+
+// ===== COVERAGE MODE (Quét trong vòng) =====
+struct CoverageMode {
+  bool active = false;
+  float minX, maxX, minY, maxY;  // Bounding box
+  float rowSpacing = 0.35f;      // 35cm giữa các hàng
+  int totalRows = 0;
+  int currentRow = 0;
+  bool movingRight = true;
+  float targetX, targetY;        // Điểm đích hiện tại
+  bool reachedTarget = false;
+  int coveredPoints = 0;
+  unsigned long startTime = 0;
+  // 🆕 THÊM CÁC BIẾN NÀY
+  int startRow = 0;           // Hàng bắt đầu
+  bool scanningDown = true;   // true = quét xuống, false = quét lên
+  int rowsCompleted = 0; 
+  unsigned long lastTurnTime = 0;     // 🆕 Thời điểm quay gần nhất
+  int consecutiveTurns = 0;
+};
+
+// ===== KIỂM TRA ĐIỂM CÓ NẰM TRONG VÒNG KHÔNG =====
+bool isPointInsideLoop(float px, float py) {
+  if(pathHistory.size() < 3) return false;
+  
+  // Ray casting algorithm
+  int crossings = 0;
+  
+  for(int i = 0; i < pathHistory.size(); i++) {
+    int j = (i + 1) % pathHistory.size();
+    
+    float x1 = pathHistory[i].x;
+    float y1 = pathHistory[i].y;
+    float x2 = pathHistory[j].x;
+    float y2 = pathHistory[j].y;
+    
+    // Kiểm tra tia ngang từ điểm cắt cạnh hay không
+    if(((y1 <= py && py < y2) || (y2 <= py && py < y1)) &&
+       (px < (x2 - x1) * (py - y1) / (y2 - y1) + x1)) {
+      crossings++;
+    }
+  }
+  
+  // Nếu số lần cắt là lẻ → điểm nằm trong
+  return (crossings % 2) == 1;
+}
+
+CoverageMode coverage;
+
+void emitWS(String s);
+void stopCar();
+
+// Hàm tính khoảng cách
+float distanceBetween(float x1, float y1, float x2, float y2) {
+  float dx = x2 - x1;
+  float dy = y2 - y1;
+  return sqrtf(dx*dx + dy*dy);
+}
+
+// 🆕 HÀM KIỂM TRA VÒNG KÍN
+void checkLoopCompletion() {
+  if(loopDetector.completed) return;
+  
+  // 🛡️ KIỂM TRA 0: KHÔNG check khi xe đang xoay, lùi, hoặc dừng!
+  if(isTurning || navState != NORMAL || currentCmd != CMD_FWD) {
+    return;
+  }
+  
+  int pathLen = pathHistory.size();
+  
+  // ⚡ THÊM: Kiểm tra khoảng cách di chuyển thực tế
+  if(pathLen < loopDetector.minPathLength) {
+    return;
+  }
+  
+  // ⚡ TÍNH TỔNG KHOẢNG CÁCH ĐÃ ĐI
+  float totalDistance = 0.0f;
+  for(int i = 1; i < pathLen; i++) {
+    totalDistance += distanceBetween(
+      pathHistory[i-1].x, pathHistory[i-1].y,
+      pathHistory[i].x, pathHistory[i].y
+    );
+  }
+  
+  // ⚡ CHỈ CHECK NẾU ĐÃ ĐI ÍT NHẤT 2M
+  if(totalDistance < loopDetector.minTravelDistance) {
+    return;
+  }
+  
+  // Chỉ kiểm tra mỗi N điểm để tiết kiệm CPU
+  if(pathLen % loopDetector.checkInterval != 0) {
+    return;
+  }
+  
+  // 🔍 Tìm điểm gần nhất trong lịch sử (trừ điểm gần đây)
+  float minDist = 999.0f;
+  int minIndex = -1;
+  
+  for(int i = 0; i < pathLen - loopDetector.skipRecent; i++) {
+    float px = pathHistory[i].x;
+    float py = pathHistory[i].y;
+    
+    float dist = distanceBetween(x, y, px, py);
+    
+    if(dist < minDist) {
+      minDist = dist;
+      minIndex = i;
+    }
+    
+    // 🎉 PHÁT HIỆN VÒNG KÍN!
+    if(dist < loopDetector.closureThreshold) {
+      // ⚡ KIỂM TRA BỔ SUNG: Tính chu vi từ điểm đóng vòng
+      float loopPerimeter = 0.0f;
+      for(int j = i; j < pathLen - 1; j++) {
+        loopPerimeter += distanceBetween(
+          pathHistory[j].x, pathHistory[j].y,
+          pathHistory[j+1].x, pathHistory[j+1].y
+        );
+      }
+      
+      // ⚡ CHỈ CHẤP NHẬN NẾU CHU VI > 1M (tránh vòng quá nhỏ)
+      if(loopPerimeter < 1.0f) {
+        Serial.printf("⚠️ Vòng quá nhỏ: %.2fm - BỎ QUA\n", loopPerimeter);
+        return;
+      }
+      
+      loopDetector.completed = true;
+      loopDetector.endTime = millis();
+      loopDetector.loopCloseIndex = i;
+      loopDetector.loopPerimeter = loopPerimeter;
+      
+      float totalTime = (loopDetector.endTime - loopDetector.startTime) / 1000.0f;
+      
+      // 📢 THÔNG BÁO
+      Serial.println("\n🎉🎉🎉 PHÁT HIỆN VÒNG KÍN - DỪNG XE! 🎉🎉🎉");
+      Serial.printf("⏱️  Thời gian: %.1f giây\n", totalTime);
+      Serial.printf("📏 Chu vi: %.2f m\n", loopDetector.loopPerimeter);
+      Serial.printf("🔄 Đóng tại điểm #%d/%d\n", i, pathLen);
+      Serial.printf("🎯 Khoảng cách đóng vòng: %.2f cm\n", dist * 100.0f);
+      Serial.printf("📊 Tổng quãng đường: %.2f m\n", totalDistance);
+      
+      // Gửi thông báo qua WebSocket
+      String completeMsg = "COMPLETE," + String(totalTime, 1) + "," + 
+                          String(loopDetector.loopPerimeter, 2) + "," +
+                          String(i);
+      emitWS(completeMsg);
+      
+      // 🛑 DỪNG XE NGAY
+      stopCar();
+      return;
+    }
+  }
+  
+  // Debug: In khoảng cách gần nhất mỗi 10 lần check
+  static int checkCount = 0;
+  if(++checkCount % 10 == 0 && minIndex != -1) {
+    Serial.printf("🔍 [%d điểm | %.2fm] Gần nhất: #%d - %.1fcm (cần < %.1fcm)\n", 
+                  pathLen, totalDistance, minIndex, 
+                  minDist*100, loopDetector.closureThreshold*100);
+  }
+}
+
+// 🆕 HÀM RESET
+void resetLoopDetection() {
+  loopDetector.completed = false;
+  loopDetector.startTime = millis();
+  loopDetector.endTime = 0;
+  loopDetector.loopPerimeter = 0.0f;
+  loopDetector.loopCloseIndex = -1;
+  pathHistory.clear();
+  
+  Serial.println("🔄 Loop detection: RESET");
+}
+
+// ===== BẮT ĐẦU CHẾ ĐỘ QUÉT =====
+void startCoverageMode() {
+  Serial.println("\n🎯🎯🎯 startCoverageMode() ĐƯỢC GỌI!");
+  Serial.printf("   Path history size: %d\n", pathHistory.size());
+  
+  if(pathHistory.size() < 20) {
+    Serial.println("❌ Cần hoàn thành vòng kín trước!");
+    emitWS("ERROR,Cần hoàn thành vòng kín trước");
+    return;
+  }
+  
+  // Tính bounding box từ path history
+  coverage.minX = coverage.maxX = pathHistory[0].x;
+  coverage.minY = coverage.maxY = pathHistory[0].y;
+  
+  for(const auto& p : pathHistory) {
+    if(p.x < coverage.minX) coverage.minX = p.x;
+    if(p.x > coverage.maxX) coverage.maxX = p.x;
+    if(p.y < coverage.minY) coverage.minY = p.y;
+    if(p.y > coverage.maxY) coverage.maxY = p.y;
+  }
+  
+  // ⚡ THU NHỎ bounding box để tránh chạy ra ngoài
+  float marginX = (coverage.maxX - coverage.minX) * 0.10f;  // 10% margin
+  float marginY = (coverage.maxY - coverage.minY) * 0.10f;
+  
+  coverage.minX += marginX;
+  coverage.maxX -= marginX;
+  coverage.minY += marginY;
+  coverage.maxY -= marginY;
+  
+  // Tính số hàng cần quét
+  float height = coverage.maxY - coverage.minY;
+  coverage.totalRows = (int)(height / coverage.rowSpacing) + 1;
+
+  Serial.printf("\n📐 TÍNH TOÁN COVERAGE:\n");
+  Serial.printf("   Height: %.2fm\n", height);
+  Serial.printf("   Row spacing: %.2fm\n", coverage.rowSpacing);
+  Serial.printf("   Total rows: %d\n", coverage.totalRows);
+  
+  if(coverage.totalRows < 2) {
+    Serial.println("❌ Vùng quá nhỏ để quét!");
+    emitWS("ERROR,Vùng quá nhỏ");
+    return;
+  }
+  
+  // Khởi tạo
+  coverage.currentRow = 0;
+  coverage.movingRight = true;
+  coverage.active = true;
+  coverage.coveredPoints = 0;
+  coverage.startTime = millis();
+  
+  // ⚡ ĐIỂM ĐẦU TIÊN: Tìm điểm gần nhất với vị trí hiện tại
+  // Thay vì đi đến góc, ta đi đến điểm gần nhất trên hàng đầu tiên
+  // ⚡ TÌM HÀNG GẦN NHẤT với vị trí hiện tại
+  int nearestRow = 0;
+  float minDistToRow = 999.0f;
+  
+  for(int i = 0; i < coverage.totalRows; i++) {
+    float rowY = coverage.minY + i * coverage.rowSpacing;
+    float distToRow = fabs(y - rowY);
+    
+    if(distToRow < minDistToRow) {
+      minDistToRow = distToRow;
+      nearestRow = i;
+    }
+  }
+  
+  // Bắt đầu từ hàng gần nhất
+  coverage.currentRow = nearestRow;
+  coverage.startRow = nearestRow;
+  coverage.scanningDown = true;      // Bắt đầu quét xuống
+  coverage.rowsCompleted = 0;
+  float startY = coverage.minY + nearestRow * coverage.rowSpacing;
+  
+  // Xác định hướng di chuyển dựa trên vị trí X hiện tại
+  if(x < (coverage.minX + coverage.maxX) / 2.0f) {
+    // Robot ở bên trái → di chuyển sang phải
+    coverage.targetX = coverage.maxX;
+    coverage.movingRight = true;
+  } else {
+    // Robot ở bên phải → di chuyển sang trái
+    coverage.targetX = coverage.minX;
+    coverage.movingRight = false;
+  }
+  
+  coverage.targetY = startY;
+  coverage.reachedTarget = false;
+  
+  Serial.printf("🎯 Bắt đầu từ HÀNG GẦN NHẤT #%d/%d\n", nearestRow, coverage.totalRows);
+  Serial.printf("   Vị trí: (%.2f, %.2f) → Target: (%.2f, %.2f)\n", 
+                x, y, coverage.targetX, coverage.targetY);
+  
+  navState = COVERAGE;
+  
+  Serial.println("\n🎯 BẮT ĐẦU CHẾ ĐỘ QUÉT ZIGZAG!");
+  Serial.printf("   Bounding box: X[%.2f -> %.2f] Y[%.2f -> %.2f]\n", 
+                coverage.minX, coverage.maxX, coverage.minY, coverage.maxY);
+  Serial.printf("   Tổng số hàng: %d\n", coverage.totalRows);
+  Serial.printf("   Target đầu: (%.2f, %.2f)\n", coverage.targetX, coverage.targetY);
+  Serial.printf("   Vị trí hiện tại: (%.2f, %.2f)\n", x, y);
+  
+  emitWS("COVERAGE_START," + String(coverage.totalRows));
+  
+  stopCar();
+  delay(200);
+}
+
+// ===== CẬP NHẬT COVERAGE =====
+// ===== CẬP NHẬT COVERAGE =====
+// ===== CẬP NHẬT COVERAGE =====
+void updateCoverage() {
+  static unsigned long lastDebugCoverage = 0;
+  if(millis() - lastDebugCoverage > 500) {  // ⚡ GIẢM TỪ 2000 → 500
+    Serial.println("\n🔄 updateCoverage() đang chạy...");
+    Serial.printf("   Active: %s\n", coverage.active ? "TRUE" : "FALSE");
+    Serial.printf("   Target: (%.2f, %.2f)\n", coverage.targetX, coverage.targetY);
+    Serial.printf("   Current: (%.2f, %.2f)\n", x, y);
+    Serial.printf("   Distance to target: %.2fm\n", sqrtf((coverage.targetX-x)*(coverage.targetX-x) + (coverage.targetY-y)*(coverage.targetY-y)));
+    Serial.printf("   Row: %d/%d (completed: %d/%d)\n", 
+                  coverage.currentRow, coverage.totalRows, 
+                  coverage.rowsCompleted, coverage.totalRows);
+    Serial.printf("   Scanning: %s\n", coverage.scanningDown ? "⬇️ DOWN" : "⬆️ UP");
+    lastDebugCoverage = millis();
+  }
+  
+  if(!coverage.active) return;
+  
+  // Tính khoảng cách đến target
+  float dx = coverage.targetX - x;
+  float dy = coverage.targetY - y;
+  float dist = sqrtf(dx*dx + dy*dy);
+  
+  // Đã đến target (trong vòng 15cm)
+  if(dist < 0.15f) {
+    coverage.reachedTarget = true;
+    coverage.coveredPoints++;
+    
+    // Đánh dấu hàng đã hoàn thành
+    coverage.rowsCompleted++;
+    Serial.println("\n✅ ĐÃ ĐẾN TARGET!");
+    Serial.printf("   Rows completed: %d/%d\n", coverage.rowsCompleted, coverage.totalRows);
+    Serial.printf("   Current row: %d\n", coverage.currentRow);
+    
+    // Kiểm tra đã quét hết chưa
+    if(coverage.rowsCompleted >= coverage.totalRows) {
+      // HOÀN THÀNH!
+      coverage.active = false;
+      stopCar();
+      
+      float totalTime = (millis() - coverage.startTime) / 1000.0f;
+      float area = (coverage.maxX - coverage.minX) * (coverage.maxY - coverage.minY);
+      
+      Serial.println("\n🎉 HOÀN THÀNH QUÉT ZIGZAG!");
+      Serial.printf("   Thời gian: %.1fs\n", totalTime);
+      Serial.printf("   Diện tích ước tính: %.2fm²\n", area);
+      Serial.printf("   Số hàng đã quét: %d\n", coverage.rowsCompleted);
+      
+      String msg = "COVERAGE_DONE," + String(totalTime,1) + "," + String(area,2);
+      emitWS(msg);
+      
+      navState = NORMAL;
+      return;
+    }
+    
+    // ⚡ TÍNH HÀNG TIẾP THEO (quét 2 chiều từ điểm bắt đầu)
+    if(coverage.scanningDown) {
+      // Đang quét xuống
+      coverage.currentRow++;
+      
+      if(coverage.currentRow >= coverage.totalRows) {
+        // Đã đến cuối, chuyển sang quét lên
+        coverage.scanningDown = false;
+        coverage.currentRow = coverage.startRow - 1;
+        
+        // Nếu đã quét hết phía dưới và không còn hàng phía trên
+        if(coverage.currentRow < 0) {
+          coverage.active = false;
+          stopCar();
+          navState = NORMAL;
+          Serial.println("🏁 Đã quét hết, kết thúc!");
+          return;
+        }
+      }
+    } else {
+      // Đang quét lên
+      coverage.currentRow--;
+      
+      if(coverage.currentRow < 0) {
+        // Đã quét hết
+        coverage.active = false;
+        stopCar();
+        navState = NORMAL;
+        Serial.println("🏁 Đã quét hết phía trên, kết thúc!");
+        return;
+      }
+    }
+    
+    // Tính Y của hàng tiếp theo
+    float nextY = coverage.minY + coverage.currentRow * coverage.rowSpacing;
+    
+    // Đổi chiều: phải <-> trái
+    coverage.movingRight = !coverage.movingRight;
+    
+    // ⚡ QUAN TRỌNG: Tính target mới và KIỂM TRA trong vòng
+    float candidateX, candidateY;
+    
+    if(coverage.movingRight) {
+      candidateX = coverage.maxX;
+      candidateY = nextY;
+    } else {
+      candidateX = coverage.minX;
+      candidateY = nextY;
+    }
+    
+    // ⚡ KIỂM TRA target có nằm trong vòng không
+    if(!isPointInsideLoop(candidateX, candidateY)) {
+      Serial.printf("⚠️ Target (%.2f, %.2f) nằm NGOÀI vòng, skip hàng này!\n", 
+                    candidateX, candidateY);
+      
+      // Skip hàng này, tăng rowsCompleted nhưng không di chuyển
+      coverage.rowsCompleted++;
+      
+      // Thử hàng tiếp theo (đệ quy logic)
+      if(coverage.scanningDown) {
+        coverage.currentRow++;
+        if(coverage.currentRow >= coverage.totalRows) {
+          coverage.scanningDown = false;
+          coverage.currentRow = coverage.startRow - 1;
+        }
+      } else {
+        coverage.currentRow--;
+      }
+      
+      if(coverage.currentRow < 0 || coverage.currentRow >= coverage.totalRows) {
+        coverage.active = false;
+        stopCar();
+        navState = NORMAL;
+        Serial.println("🏁 Hết hàng, kết thúc coverage!");
+        return;
+      }
+      
+      // Tính lại target
+      nextY = coverage.minY + coverage.currentRow * coverage.rowSpacing;
+      coverage.movingRight = !coverage.movingRight;
+      
+      if(coverage.movingRight) {
+        candidateX = coverage.maxX;
+        candidateY = nextY;
+      } else {
+        candidateX = coverage.minX;
+        candidateY = nextY;
+      }
+    }
+    
+    coverage.targetX = candidateX;
+    coverage.targetY = candidateY;
+    coverage.reachedTarget = false;
+    
+    Serial.printf("🎯 Hàng %d/%d (%s): Target (%.2f, %.2f) - %s\n", 
+                  coverage.rowsCompleted + 1, coverage.totalRows,
+                  coverage.scanningDown ? "⬇️ Xuống" : "⬆️ Lên",
+                  coverage.targetX, coverage.targetY,
+                  isPointInsideLoop(coverage.targetX, coverage.targetY) ? "✅ TRONG vòng" : "❌ NGOÀI vòng");
+    
+    String msg = "COVERAGE_PROGRESS," + String(coverage.rowsCompleted) + "," + 
+                 String(coverage.totalRows);
+    emitWS(msg);
+  }
+  
+  // ⚡ KIỂM TRA: Nếu quay quá nhiều lần → bỏ qua và tiến thẳng
+  if(isTurning) {
+    unsigned long now = millis();
+    if(now - coverage.lastTurnTime < 2000) {
+      coverage.consecutiveTurns++;
+    } else {
+      coverage.consecutiveTurns = 0;
+    }
+    coverage.lastTurnTime = now;
+    
+    if(coverage.consecutiveTurns > 5) {
+      Serial.println("⚠️ Đã quay quá nhiều lần (>5), bỏ qua và tiến thẳng!");
+      coverage.consecutiveTurns = 0;
+      isTurning = false;
+      stopCar();
+      delay(100);
+      // Không return, cho phép tiến thẳng
+    } else {
+      updateTurn();
+      return;
+    }
+  }
+  // ĐIỀU KHIỂN DI CHUYỂN ĐẾN TARGET
+  // Tính góc cần quay
+  float angleToTarget = atan2f(dy, dx);
+  float angleDiff = angleToTarget - th;
+  
+  // Chuẩn hóa góc về [-PI, PI]
+  while(angleDiff > 3.14159f) angleDiff -= 2.0f * 3.14159f;
+  while(angleDiff < -3.14159f) angleDiff += 2.0f * 3.14159f;
+  
+  // Nếu sai lệch góc > 20 độ → quay
+  if(fabs(angleDiff) > 1.05f && !isTurning) {
+    stopCar();
+    delay(50);
+    
+    if(angleDiff > 0) {
+      startTurnLeft();
+    } else {
+      startTurnRight();
+    }
+    return;
+  }
+  // ⚡ NẾU GÓC CHÊNH < 60 độ → TIẾN LUÔN
+  if(fabs(angleDiff) <= 1.05f) {
+    if(fabs(angleDiff) > 0.35f) {
+      Serial.printf("➡️ Góc lệch %.1f° nhưng vẫn tiến\n", angleDiff*57.3f);
+    }
+  }
+  
+  
+  // Nếu có vật cản phía trước → dừng và quay
+  if(distanceFront < OBSTACLE_THRESHOLD) {
+    stopCar();
+    delay(50);
+    
+    // Quay theo hướng ít vật cản hơn
+    if(distanceRight > distanceLeft) {
+      startTurnRight();
+    } else {
+      startTurnLeft();
+    }
+    return;
+  }
+  
+  // ⚡ KIỂM TRA: Nếu vị trí hiện tại ra NGOÀI vòng → quay lại
+  if(!isPointInsideLoop(x, y)) {
+    Serial.println("⚠️ Robot đang ở NGOÀI vòng! Dừng và quay lại!");
+    stopCar();
+    delay(100);
+    
+    // Tính hướng về tâm vòng
+    float centerX = (coverage.minX + coverage.maxX) / 2.0f;
+    float centerY = (coverage.minY + coverage.maxY) / 2.0f;
+    
+    float angleToCenter = atan2f(centerY - y, centerX - x);
+    angleDiff = angleToCenter - th;
+    
+    while(angleDiff > 3.14159f) angleDiff -= 2.0f * 3.14159f;
+    while(angleDiff < -3.14159f) angleDiff += 2.0f * 3.14159f;
+    
+    if(!isTurning) {
+      if(angleDiff > 0) {
+        startTurnLeft();
+      } else {
+        startTurnRight();
+      }
+    }
+    return;
+  }
+  
+  // Di chuyển tiến
+  moveForward(SPEED_FORWARD);
+}
+
+// ===== HTML (giữ nguyên) =====
+const char INDEX_HTML[] PROGMEM = R"HTML(
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Robot Map 2D</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { 
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      min-height: 100vh;
+      padding: 20px;
+    }
+    .container {
+      max-width: 1400px;
+      margin: 0 auto;
+    }
+    h1 { 
+      color: white;
+      text-align: center;
+      margin-bottom: 20px;
+      font-size: 32px;
+      text-shadow: 0 2px 4px rgba(0,0,0,0.3);
+    }
+    .content {
+      display: grid;
+      grid-template-columns: 1fr 300px;
+      gap: 20px;
+    }
+    .map-panel {
+      background: white;
+      border-radius: 16px;
+      padding: 20px;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.2);
+    }
+    canvas {
+      border: 3px solid #333;
+      border-radius: 8px;
+      background: white;
+      display: block;
+      width: 100%;
+      height: auto;
+    }
+    .controls {
+      margin-top: 15px;
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .side-panel {
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+    .card {
+      background: white;
+      border-radius: 16px;
+      padding: 20px;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.2);
+    }
+    .card h3 {
+      margin-bottom: 15px;
+      color: #333;
+      font-size: 18px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    button {
+      padding: 12px 20px;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      font-weight: 600;
+      transition: transform 0.2s, box-shadow 0.2s;
+      font-size: 14px;
+    }
+    button:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+    }
+    button:active { transform: translateY(0); }
+    .sensor-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 10px;
+      margin-top: 10px;
+    }
+    .sensor-item {
+      background: #f8f9fa;
+      padding: 12px;
+      border-radius: 8px;
+      text-align: center;
+    }
+    .sensor-label {
+      font-size: 12px;
+      color: #666;
+      margin-bottom: 4px;
+    }
+    .sensor-value {
+      font-size: 24px;
+      font-weight: bold;
+      color: #333;
+    }
+    .sensor-unit {
+      font-size: 12px;
+      color: #999;
+    }
+    .status-indicator {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      margin-right: 8px;
+    }
+    .status-indicator.connected { background: #10b981; }
+    .status-indicator.disconnected { background: #ef4444; }
+    .pose-info {
+      font-family: 'Courier New', monospace;
+      font-size: 13px;
+      line-height: 1.8;
+      color: #555;
+    }
+    .zoom-controls {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .zoom-level {
+      min-width: 60px;
+      text-align: center;
+      font-weight: 600;
+      color: #667eea;
+    }
+    .person-status {
+      padding: 10px;
+      background: #e8f5e9;
+      border-radius: 8px;
+      margin-top: 10px;
+      font-size: 13px;
+      color: #2e7d32;
+      font-weight: 600;
+    }
+    .person-status.not-detected {
+      background: #fce4ec;
+      color: #c2185b;
+    }
+    .legend {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-top: 10px;
+      font-size: 12px;
+    }
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .legend-color {
+      width: 16px;
+      height: 16px;
+      border-radius: 3px;
+    }
+    .loop-status {
+      padding: 10px;
+      background: #e3f2fd;
+      border-radius: 8px;
+      margin-top: 10px;
+      font-size: 13px;
+      color: #1976d2;
+      font-weight: 600;
+    }
+    .completion-overlay {
+      display: none;
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0, 0, 0, 0.85);
+      z-index: 1000;
+      justify-content: center;
+      align-items: center;
+    }
+    .completion-overlay.show { display: flex; }
+    .completion-card {
+      background: white;
+      border-radius: 20px;
+      padding: 40px;
+      text-align: center;
+      max-width: 500px;
+      animation: slideUp 0.5s ease-out;
+    }
+    @keyframes slideUp {
+      from { transform: translateY(50px); opacity: 0; }
+      to { transform: translateY(0); opacity: 1; }
+    }
+    .completion-icon { font-size: 80px; margin-bottom: 20px; }
+    .completion-title {
+      font-size: 32px;
+      font-weight: bold;
+      color: #4CAF50;
+      margin-bottom: 20px;
+    }
+    .completion-stats {
+      background: #f5f5f5;
+      padding: 20px;
+      border-radius: 12px;
+      margin: 20px 0;
+      text-align: left;
+    }
+    .stat-row {
+      display: flex;
+      justify-content: space-between;
+      margin: 10px 0;
+      font-size: 16px;
+    }
+    .stat-label { color: #666; }
+    .stat-value { font-weight: bold; color: #333; }
+    .completion-buttons {
+      display: flex;
+      gap: 10px;
+      margin-top: 20px;
+    }
+    .completion-buttons button { flex: 1; }
+    @media (max-width: 1024px) {
+      .content { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>🤖 Robot Navigation Map 2D</h1>
+    
+    <div class="content">
+      <div class="map-panel">
+        <canvas id="cv" width="800" height="600"></canvas>
+        <div class="controls">
+          <button onclick="resetMap()">🔄 Reset Map</button>
+          <button onclick="toggleFollow()">📍 Toggle Follow</button>
+          <div class="zoom-controls">
+            <button onclick="zoomOut()">➖</button>
+            <span class="zoom-level" id="zoomLevel">100%</span>
+            <button onclick="zoomIn()">➕</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="side-panel">
+        <div class="card">
+          <h3>
+            <span class="status-indicator" id="statusDot"></span>
+            Connection
+          </h3>
+          <div class="pose-info" id="poseInfo">Connecting...</div>
+        </div>
+        
+        <div class="card">
+          <h3>🔄 Loop Status</h3>
+          <div class="loop-status" id="loopStatus">
+            Chờ bắt đầu...
+          </div>
+          <div style="margin-top: 10px;">
+            <button onclick="startCoverage()" id="btnCoverage" style="width: 100%; padding: 15px; font-size: 16px;">
+              🔄 Quét toàn bộ trong vòng
+            </button>
+          </div>
+          <div class="loop-status" id="coverageStatus" style="display: none; margin-top: 10px;">
+            Đang quét...
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>📏 Sensors</h3>
+          <div class="sensor-grid">
+            <div class="sensor-item">
+              <div class="sensor-label">LEFT</div>
+              <div class="sensor-value" id="sensorL">--</div>
+              <div class="sensor-unit">cm</div>
+            </div>
+            <div class="sensor-item">
+              <div class="sensor-label">FRONT</div>
+              <div class="sensor-value" id="sensorF">--</div>
+              <div class="sensor-unit">cm</div>
+            </div>
+            <div class="sensor-item">
+              <div class="sensor-label">RIGHT</div>
+              <div class="sensor-value" id="sensorR">--</div>
+              <div class="sensor-unit">cm</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>👤 Person Detection</h3>
+          <div class="person-status" id="personStatus">
+            No person detected
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>🎨 Map Legend</h3>
+          <div class="legend">
+            <div class="legend-item">
+              <div class="legend-color" style="background: #4CAF50;"></div>
+              <span>Path / Robot</span>
+            </div>
+            <div class="legend-item">
+              <div class="legend-color" style="background: #2196F3;"></div>
+              <span>Free Space</span>
+            </div>
+            <div class="legend-item">
+              <div class="legend-color" style="background: #F44336;"></div>
+              <span>Obstacles</span>
+            </div>
+            <div class="legend-item">
+              <div class="legend-color" style="background: #9C27B0;"></div>
+              <span>Person</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>ℹ️ Info</h3>
+          <div style="font-size: 13px; color: #666; line-height: 1.8;">
+            • Web: http://ESP32_IP/<br/>
+            • WebSocket: port 81<br/>
+            • TCP Sensors: port 8080<br/>
+            • Real-time SLAM mapping
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Completion Overlay -->
+  <div class="completion-overlay" id="completionOverlay">
+    <div class="completion-card">
+      <div class="completion-icon">🎉</div>
+      <div class="completion-title">Hoàn thành vòng kín!</div>
+      <div class="completion-stats">
+        <div class="stat-row">
+          <span class="stat-label">⏱️ Thời gian:</span>
+          <span class="stat-value" id="completionTime">--</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">📏 Chu vi vòng:</span>
+          <span class="stat-value" id="completionDistance">--</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">🛤️ Số điểm:</span>
+          <span class="stat-value" id="completionPoints">--</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">🔄 Đóng tại điểm:</span>
+          <span class="stat-value" id="completionIndex">--</span>
+        </div>
+      </div>
+      <div class="completion-buttons">
+        <button onclick="closeCompletion()">Đóng</button>
+        <button onclick="resetAndRestart()">Bắt đầu lại</button>
+      </div>
+    </div>
+  </div>
+
+<script>
+let ws;
+let pose = {x:0, y:0, th:0};
+let path = [];
+let obs = [];
+let freeSpace = [];
+let personPos = null;
+let follow = true;
+let zoom = 1.0;
+let loopCompleted = false;  // 🆕 THÊM DÒNG NÀY
+
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+const BASE_SCALE = 160;
+
+function connectWS(){
+  const host = location.hostname;
+  ws = new WebSocket(`ws://${host}:81/`);
+  ws.onopen = () => updateStatus(true);
+  ws.onclose = () => { updateStatus(false); setTimeout(connectWS, 1000); };
+  ws.onerror = () => updateStatus(false);
+  ws.onmessage = (ev) => handle(ev.data);
+}
+
+function updateStatus(connected){
+  const dot = document.getElementById('statusDot');
+  dot.className = 'status-indicator ' + (connected ? 'connected' : 'disconnected');
+  
+  if(connected) {
+    updatePoseInfo();
+  } else {
+    document.getElementById('poseInfo').textContent = 'Disconnected';
+  }
+}
+
+function updatePoseInfo(){
+  const info = document.getElementById('poseInfo');
+  info.innerHTML = 
+    `X: ${pose.x.toFixed(2)} m<br/>` +
+    `Y: ${pose.y.toFixed(2)} m<br/>` +
+    `θ: ${(pose.th * 57.3).toFixed(1)}°<br/>` +
+    `Path: ${path.length} pts<br/>` +
+    `Free: ${freeSpace.length} pts<br/>` +
+    `Obstacles: ${obs.length} pts`;
+}
+
+function updateSensors(l, r, f){
+  document.getElementById('sensorL').textContent = l === 999 ? '--' : l;
+  document.getElementById('sensorF').textContent = f === 999 ? '--' : f;
+  document.getElementById('sensorR').textContent = r === 999 ? '--' : r;
+}
+
+function updatePersonStatus(){
+  const statusDiv = document.getElementById('personStatus');
+  if(personPos) {
+    statusDiv.className = 'person-status';
+    statusDiv.innerHTML = `✅ Person detected<br/>X: ${personPos.x.toFixed(2)} m<br/>Y: ${personPos.y.toFixed(2)} m`;
+  } else {
+    statusDiv.className = 'person-status not-detected';
+    statusDiv.textContent = '❌ No person detected';
+  }
+}
+
+
+// 🆕 THÊM CÁC HÀM MỚI
+function updateLoopStatus(){
+  const loopStatus = document.getElementById('loopStatus');
+  if(loopCompleted) {
+    loopStatus.style.background = '#c8e6c9';
+    loopStatus.style.color = '#2e7d32';
+    loopStatus.innerHTML = '✅ Đã hoàn thành vòng kín!';
+  } else if(path.length > 10) {
+    loopStatus.style.background = '#fff3e0';
+    loopStatus.style.color = '#e65100';
+    loopStatus.innerHTML = `🔄 Đang dò...<br/>Số điểm: ${path.length}`;
+  } else {
+    loopStatus.style.background = '#e3f2fd';
+    loopStatus.style.color = '#1976d2';
+    loopStatus.innerHTML = '⏳ Chờ bắt đầu...';
+  }
+}
+
+// 🆕 THÊM HÀM NÀY
+function startCoverage(){
+  if(!loopCompleted) {
+    alert('⚠️ Cần hoàn thành vòng kín trước!');
+    return;
+  }
+  
+  if(confirm('Bắt đầu quét toàn bộ diện tích trong vòng?')) {
+    if(ws && ws.readyState === WebSocket.OPEN) {
+      ws.send('START_COVERAGE');
+    }
+  }
+}
+
+function updateCoverageStatus(currentRow, totalRows){
+  const coverageStatus = document.getElementById('coverageStatus');
+  const btnCoverage = document.getElementById('btnCoverage');
+  
+  if(currentRow > 0) {
+    coverageStatus.style.display = 'block';
+    coverageStatus.style.background = '#fff3e0';
+    coverageStatus.style.color = '#e65100';
+    
+    let percent = Math.round((currentRow / totalRows) * 100);
+    coverageStatus.innerHTML = `🔄 Đang quét: ${percent}%<br/>Hàng ${currentRow}/${totalRows}`;
+    
+    btnCoverage.disabled = true;
+    btnCoverage.style.opacity = '0.5';
+  } else {
+    coverageStatus.style.display = 'none';
+    btnCoverage.disabled = false;
+    btnCoverage.style.opacity = '1';
+  }
+}
+
+function showCompletion(time, distance, index){
+  loopCompleted = true;
+  document.getElementById('completionTime').textContent = time.toFixed(1) + 's';
+  document.getElementById('completionDistance').textContent = distance.toFixed(2) + 'm';
+  document.getElementById('completionPoints').textContent = path.length;
+  document.getElementById('completionIndex').textContent = '#' + index;
+  document.getElementById('completionOverlay').classList.add('show');
+  updateLoopStatus();
+}
+
+function closeCompletion(){
+  document.getElementById('completionOverlay').classList.remove('show');
+}
+
+function resetAndRestart(){
+  // 🔥 GỬI LỆNH RESET XUỐNG ESP32
+  if(ws && ws.readyState === WebSocket.OPEN) {
+    ws.send('RESET');
+  }
+  
+  resetMap();
+  closeCompletion();
+  loopCompleted = false;
+  updateLoopStatus();
+}
+
+
+function handle(msg){
+  const parts = msg.trim().split(",");
+  
+  if(parts[0] === "POSE" && parts.length >= 4){
+    pose.x = parseFloat(parts[1]);
+    pose.y = parseFloat(parts[2]);
+    pose.th = parseFloat(parts[3]);
+    path.push({x: pose.x, y: pose.y});
+    if(path.length > 2000) path.shift();
+    
+  } else if(parts[0] === "OBS" && parts.length >= 4){
+    obs.push({
+      x: parseFloat(parts[1]), 
+      y: parseFloat(parts[2]),
+      type: parts[3]
+    });
+    if(obs.length > 2000) obs.shift();
+    
+  } else if(parts[0] === "FREE" && parts.length >= 3){
+    freeSpace.push({x: parseFloat(parts[1]), y: parseFloat(parts[2])});
+    if(freeSpace.length > 2000) freeSpace.shift();
+    
+  } else if(parts[0] === "RANGE" && parts.length >= 4){
+    updateSensors(parseInt(parts[1]), parseInt(parts[2]), parseInt(parts[3]));
+    
+  } else if(parts[0] === "PERSON" && parts.length >= 3){
+    personPos = {
+      x: parseFloat(parts[1]),
+      y: parseFloat(parts[2])
+    };
+    updatePersonStatus();
+    
+  } else if(parts[0] === "COMPLETE" && parts.length >= 4){
+    const time = parseFloat(parts[1]);
+    const distance = parseFloat(parts[2]);
+    const index = parseInt(parts[3]);
+    showCompletion(time, distance, index);
+    
+  } else if(parts[0] === "COVERAGE_START" && parts.length >= 2){
+    const totalRows = parseInt(parts[1]);
+    updateCoverageStatus(0, totalRows);
+    
+  } else if(parts[0] === "COVERAGE_PROGRESS" && parts.length >= 3){
+    const currentRow = parseInt(parts[1]);
+    const totalRows = parseInt(parts[2]);
+    updateCoverageStatus(currentRow, totalRows);
+    
+  } else if(parts[0] === "COVERAGE_DONE" && parts.length >= 3){
+    const time = parseFloat(parts[1]);
+    const area = parseFloat(parts[2]);
+    updateCoverageStatus(0, 0);
+    alert(`🎉 Hoàn thành quét!\n⏱️ Thời gian: ${time.toFixed(1)}s\n📏 Diện tích: ${area.toFixed(2)}m²`);
+    
+  } else if(parts[0] === "COVERAGE_STOPPED"){
+    updateCoverageStatus(0, 0);
+  }
+  
+  updatePoseInfo();
+  updateLoopStatus();
+}
+
+function worldToCanvas(wx, wy, cx0, cy0, scale){
+  return { 
+    x: cx0 + wx * scale, 
+    y: cy0 - wy * scale 
+  };
+}
+
+function draw(){
+  ctx.clearRect(0, 0, cv.width, cv.height);
+
+  const scale = BASE_SCALE * zoom;
+  let cx0 = cv.width / 2;
+  let cy0 = cv.height / 2;
+  
+  if(follow){
+    cx0 = cv.width / 2 - pose.x * scale;
+    cy0 = cv.height / 2 + pose.y * scale;
+  }
+
+  // Grid
+  ctx.strokeStyle = '#f0f0f0';
+  ctx.lineWidth = 1;
+  const gridSize = 40 * zoom;
+  for(let x = 0; x < cv.width; x += gridSize){
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, cv.height);
+    ctx.stroke();
+  }
+  for(let y = 0; y < cv.height; y += gridSize){
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(cv.width, y);
+    ctx.stroke();
+  }
+
+  // Free space (Màu xanh dương nhạt - nơi không có vật cản)
+  if(freeSpace.length > 0){
+    ctx.fillStyle = 'rgba(33, 150, 243, 0.25)';  // Màu xanh dương nhạt
+    for(const fs of freeSpace){
+      const p = worldToCanvas(fs.x, fs.y, cx0, cy0, scale);
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 6 * zoom, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  // Obstacles (Màu đỏ - vật cản)
+  ctx.fillStyle = '#F44336';  // Màu đỏ
+  for(const o of obs){
+    const p = worldToCanvas(o.x, o.y, cx0, cy0, scale);
+    if(o.type === 'L' || o.type === 'R') {
+      ctx.fillStyle = '#2196F3';  // Xanh dương cho 2 bên
+    } else {
+      ctx.fillStyle = '#F44336';  // Đỏ cho phía trước
+  }
+  
+  ctx.beginPath();
+  ctx.arc(p.x, p.y, 5 * zoom, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+  // Path (Màu xanh lá - đường đi)
+  if(path.length > 1){
+    ctx.strokeStyle = '#4CAF50';  // Màu xanh lá
+    ctx.lineWidth = 3 * zoom;
+    ctx.beginPath();
+    let p0 = worldToCanvas(path[0].x, path[0].y, cx0, cy0, scale);
+    ctx.moveTo(p0.x, p0.y);
+    for(let i = 1; i < path.length; i++){
+      let pi = worldToCanvas(path[i].x, path[i].y, cx0, cy0, scale);
+      ctx.lineTo(pi.x, pi.y);
+    }
+    ctx.stroke();
+  }
+
+  // Person (Màu tím)
+  if(personPos) {
+    const pp = worldToCanvas(personPos.x, personPos.y, cx0, cy0, scale);
+    
+    // Vòng tròn ngoài màu tím nhạt
+    ctx.fillStyle = 'rgba(156, 39, 176, 0.3)';
+    ctx.beginPath();
+    ctx.arc(pp.x, pp.y, 20 * zoom, 0, Math.PI * 2);
+    ctx.fill();
+    
+    // Chấm giữa màu tím đậm
+    ctx.fillStyle = '#9C27B0';  // Màu tím
+    ctx.beginPath();
+    ctx.arc(pp.x, pp.y, 10 * zoom, 0, Math.PI * 2);
+    ctx.fill();
+    
+    // Viền tím đậm hơn
+    ctx.strokeStyle = '#7B1FA2';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    
+    // Icon người
+    ctx.fillStyle = 'white';
+    ctx.font = `${14 * zoom}px Arial`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('👤', pp.x, pp.y);
+  }
+  if(window.coverageBounds && window.coverageBounds.active) {
+    // Bạn cần gửi thêm message từ ESP32: "COVERAGE_BOUNDS,minX,maxX,minY,maxY"
+    // Rồi vẽ hình chữ nhật ở đây
+  }
+
+  // Robot (Màu xanh lá)
+  const pr = worldToCanvas(pose.x, pose.y, cx0, cy0, scale);
+  const ang = -pose.th;
+  const size = 15 * zoom;
+  const p1 = {x: pr.x + Math.cos(ang) * size, y: pr.y + Math.sin(ang) * size};
+  const p2 = {x: pr.x + Math.cos(ang + 2.5) * size * 0.8, y: pr.y + Math.sin(ang + 2.5) * size * 0.8};
+  const p3 = {x: pr.x + Math.cos(ang - 2.5) * size * 0.8, y: pr.y + Math.sin(ang - 2.5) * size * 0.8};
+
+  ctx.fillStyle = '#4CAF50';  // Màu xanh lá
+  ctx.beginPath();
+  ctx.moveTo(p1.x, p1.y);
+  ctx.lineTo(p2.x, p2.y);
+  ctx.lineTo(p3.x, p3.y);
+  ctx.closePath();
+  ctx.fill();
+  
+  ctx.strokeStyle = '#2E7D32';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+}
+
+function resetMap(){
+  if(confirm('Reset map data?')){
+    // 🔥 GỬI LỆNH RESET XUỐNG ESP32
+    if(ws && ws.readyState === WebSocket.OPEN) {
+      ws.send('RESET');
+    }
+    
+    path = [];
+    obs = [];
+    freeSpace = [];
+    personPos = null;
+    pose = {x:0, y:0, th:0};
+    loopCompleted = false;
+    updatePersonStatus();
+    updateLoopStatus();
+    draw();
+  }
+}
+
+function toggleFollow(){
+  follow = !follow;
+  draw();
+}
+
+function zoomIn(){
+  zoom = Math.min(zoom * 1.2, 3.0);
+  updateZoomLevel();
+  draw();
+}
+
+function zoomOut(){
+  zoom = Math.max(zoom / 1.2, 0.3);
+  updateZoomLevel();
+  draw();
+}
+
+function updateZoomLevel(){
+  document.getElementById('zoomLevel').textContent = Math.round(zoom * 100) + '%';
+}
+
+connectWS();
+draw();
+setInterval(draw, 50);
+</script>
+</body>
+</html>
+)HTML";
+
+// ===== Helpers =====
+long measureFrontDistance() {
+  digitalWrite(TRIG_PIN, LOW); 
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH); 
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+  long distance = duration * 0.034 / 2;
+  if (distance == 0 || distance > 200) distance = 999;
+  return distance;
+}
+
+void emitWS(String s) {
+  ws.broadcastTXT(s);
+}
+
+void emitObstacle(float dist_m, float relAngle, char type) {
+  if(dist_m > 2.5f) return;
+  float ox = x + dist_m * cosf(th + relAngle);
+  float oy = y + dist_m * sinf(th + relAngle);
+  // ⚡ THÊM TYPE VÀO MESSAGE
+  String msg = "OBS," + String(ox, 3) + "," + String(oy, 3) + "," + String(type);
+  emitWS(msg);
+}
+
+void updatePose() {
+  unsigned long now = millis();
+  if (lastPoseMs == 0) lastPoseMs = now;
+  float dt = (now - lastPoseMs) / 1000.0f;
+  lastPoseMs = now;
+
+  float target_v = 0.0f, target_w = 0.0f;
+
+  switch (currentCmd) {
+    case CMD_FWD:    target_v = V_FWD;  break;
+    case CMD_BACK:   target_v = -V_BACK; break;
+    case CMD_TURN_L: target_w = +W_TURN; break;
+    case CMD_TURN_R: target_w = -W_TURN; break;
+    default: break;
+  }
+
+  vx = vx * VELOCITY_ALPHA + target_v * cosf(th) * (1.0f - VELOCITY_ALPHA);
+  vy = vy * VELOCITY_ALPHA + target_v * sinf(th) * (1.0f - VELOCITY_ALPHA);
+  vth = vth * VELOCITY_ALPHA + target_w * (1.0f - VELOCITY_ALPHA);
+
+  x += vx * dt;
+  y += vy * dt;
+  th += vth * dt;
+
+  while(th > 3.1415926f) th -= 2.0f * 3.1415926f;
+  while(th < -3.1415926f) th += 2.0f * 3.1415926f;
+}
+
+// ===== Motor control =====
+void stopCar() {
+  currentCmd = CMD_STOP;
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+  pwmWriteA(0); pwmWriteB(0);
+  isTurning = false;
+}
+
+void moveForward(int speed) {
+  if(isTurning) return;
+  currentCmd = CMD_FWD;
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);  pwmWriteA(speed);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);  pwmWriteB(speed);
+}
+
+void moveBackward(int speed) {
+  if(isTurning) return;
+  currentCmd = CMD_BACK;
+  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH); pwmWriteA(speed);
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH); pwmWriteB(speed);
+}
+
+void startTurnLeft() {
+  currentCmd = CMD_TURN_L;
+  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH); pwmWriteA(SPEED_TURN);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);  pwmWriteB(SPEED_TURN);
+  isTurning = true;
+  turnStartMs = millis();
+}
+
+void startTurnRight() {
+  currentCmd = CMD_TURN_R;
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);  pwmWriteA(SPEED_TURN);
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH); pwmWriteB(SPEED_TURN);
+  isTurning = true;
+  turnStartMs = millis();
+}
+
+void updateTurn() {
+  if(isTurning && (millis() - turnStartMs >= TURN_DURATION)) {
+    stopCar();
+  }
+}
+
+// ===== TCP client check =====
+void checkTCPClient() {
+  if (millis() - lastClientCheck < 1000) return;
+  lastClientCheck = millis();
+
+  if (!tcpClient || !tcpClient.connected()) {
+    tcpClient = tcpServer.available();
+    if (tcpClient) {
+      Serial.println("\n✅ Client connected!");
+      Serial.print("   IP: ");
+      Serial.println(tcpClient.remoteIP());
+    }
+  }
+}
+
+// ===== Receive sensor data - FIXED JSON PARSING =====
+void receiveSensorData() {
+  if (!tcpClient || !tcpClient.connected()) return;
+  
+  while(tcpClient.available()) {
+    String data = tcpClient.readStringUntil('\n');
+    data.trim();
+
+    if(data.length() == 0) continue;
+
+    // Dùng ArduinoJson để parse
+    StaticJsonDocument<512> doc;
+    DeserializationError error = deserializeJson(doc, data);
+    
+    if (error) {
+      Serial.print("❌ JSON parse failed: ");
+      Serial.println(error.c_str());
+      Serial.print("   Raw data: ");
+      Serial.println(data);
+      continue;
+    }
+
+    // Parse left và right
+    if(doc.containsKey("left")) {
+      distanceLeft = doc["left"].as<int>();
+    }
+    
+    if(doc.containsKey("right")) {
+      distanceRight = doc["right"].as<int>();
+    }
+
+    // Parse person object
+if(doc.containsKey("person")) {
+  JsonObject personObj = doc["person"];
+  
+  if(personObj.containsKey("detected")) {
+    person.detected = personObj["detected"].as<bool>();
+    
+    if(person.detected) {
+      if(personObj.containsKey("x") && personObj.containsKey("y")) {
+        int16_t px = personObj["x"].as<int16_t>();
+        int16_t py = personObj["y"].as<int16_t>();
+        
+        // Convert mm to meters (tọa độ tương đối từ radar)
+        // px từ radar: trái/phải (âm = phải, dương = trái)
+        // py từ radar: phía trước
+        float local_forward = py / 1000.0f;  // Khoảng cách phía trước
+        float local_side = -px / 1000.0f;    // Khoảng cách sang trái (+) / phải (-)
+        
+        // Chuyển đổi từ tọa độ radar sang tọa độ thế giới
+        float cos_th = cosf(th);
+        float sin_th = sinf(th);
+        
+        // Tọa độ người trong hệ thế giới
+        person.x = x + local_forward * cos_th - local_side * sin_th;
+        person.y = y + local_forward * sin_th + local_side * cos_th;
+        
+        // Emit to WebSocket với tọa độ thế giới
+        String personMsg = "PERSON," + String(person.x, 3) + "," + String(person.y, 3);
+        emitWS(personMsg);
+        
+        Serial.printf("✅ Person: forward=%.2fm side=%.2fm -> world(%.2f,%.2f) | robot(%.2f,%.2f,%.2f°)\n",
+                      local_forward, local_side, person.x, person.y, x, y, th*57.3f);
+      }
+    } else {
+      person.x = 0.0f;
+      person.y = 0.0f;
+    }
+  }
+}
+    
+    lastLRms = millis();
+  }
+
+  // Timeout check
+  if(millis() - lastLRms > 1500) {
+    distanceLeft = 999;
+    distanceRight = 999;
+    person.detected = false;
+  }
+}
+
+
+
+
+void driveControl() {
+  // ⚡ THÊM DEBUG THƯỜNG XUYÊN
+  static unsigned long lastDebugDrive = 0;
+  if(millis() - lastDebugDrive > 5000) {
+    Serial.println("\n🔍 DRIVE STATUS:");
+    Serial.printf("   Loop completed: %s\n", loopDetector.completed ? "TRUE" : "FALSE");
+    Serial.printf("   Nav state: %d (%s)\n", navState, 
+                  navState==NORMAL ? "NORMAL" : navState==BACKING ? "BACKING" : "WAITING");
+    Serial.printf("   Current cmd: %d\n", currentCmd);
+    Serial.printf("   Is turning: %s\n", isTurning ? "YES" : "NO");
+    Serial.printf("   Sensors: F=%d L=%d R=%d\n", distanceFront, distanceLeft, distanceRight);
+    lastDebugDrive = millis();
+  }
+  
+  // ⚡ NẾU COMPLETED → DỪNG VÀ CẢNH BÁO
+  if(loopDetector.completed && navState != COVERAGE) {
+    static unsigned long lastWarn = 0;
+    if(millis() - lastWarn > 3000) {
+      Serial.println("⚠️ Xe đang dừng vì completed=TRUE. Nhấn 'Quét toàn bộ' hoặc RESET!");
+      lastWarn = millis();
+    }
+    stopCar();
+    return;
+  }
+
+  updateTurn();
+  if(isTurning) return;
+
+  switch(navState) {
+    case COVERAGE:
+      Serial.println("🔍 Đang ở case COVERAGE");  // 🆕 DEBUG
+      updateCoverage();
+      return;
+    case NORMAL:
+      if(distanceFront < OBSTACLE_THRESHOLD) {
+        Serial.print("⚠️ Obstacle ahead! ");
+        stopCar();
+        delay(100);
+
+        if(distanceRight >= OBSTACLE_THRESHOLD || distanceRight == 999) {
+          Serial.println("→ Turn RIGHT");
+          startTurnRight();
+          navState = WAITING;
+          stateStartMs = millis();
+        } 
+        else if(distanceLeft >= OBSTACLE_THRESHOLD || distanceLeft == 999) {
+          Serial.println("→ Turn LEFT");
+          startTurnLeft();
+          navState = WAITING;
+          stateStartMs = millis();
+        } 
+        else {
+          Serial.println("→ BACKUP");
+          moveBackward(SPEED_BACKUP);
+          navState = BACKING;
+          stateStartMs = millis();
+        }
+      } else {
+        // ✅ CHẠY TIẾN BÌNH THƯỜNG
+        moveForward(SPEED_FORWARD);
+      }
+      break;
+
+    case BACKING:
+      if(millis() - stateStartMs > 1000) {
+        stopCar();
+        delay(100);
+        startTurnRight();
+        navState = WAITING;
+        stateStartMs = millis();
+      }
+      break;
+
+    case WAITING:
+      if(millis() - stateStartMs > 200 && !isTurning) {
+        navState = NORMAL;
+        Serial.println("✅ Quay lại chế độ NORMAL");
+      }
+      break;
+  }
+}
+
+
+// ===== Web handlers =====
+void handleRoot() {
+  web.send_P(200, "text/html", INDEX_HTML);
+}
+
+void resetSystem() {
+  Serial.println("\n🔄🔄🔄 RESETTING SYSTEM 🔄🔄🔄");
+  
+  // 1. Stop car NGAY LẬP TỨC
+  stopCar();
+  delay(200);
+  
+  // 2. Reset loop detection
+  pathHistory.clear();
+  loopDetector.completed = false;  // ⚡ QUAN TRỌNG NHẤT!
+  loopDetector.startTime = millis();
+  loopDetector.endTime = 0;
+  loopDetector.loopPerimeter = 0.0f;
+  loopDetector.loopCloseIndex = -1;
+  
+  // 3. Reset pose & velocity
+  x = 0.0f; 
+  y = 0.0f; 
+  th = 0.0f;
+  vx = 0.0f;
+  vy = 0.0f;
+  vth = 0.0f;
+  lastPoseMs = millis();
+  
+  // 4. Reset navigation state
+  navState = NORMAL;
+  isTurning = false;
+  turnStartMs = 0;
+  currentCmd = CMD_STOP;
+  
+  // 5. Reset sensors
+  distanceFront = 999;
+  distanceLeft = 999;
+  distanceRight = 999;
+  lastSensorRead = millis();
+  
+  // 6. Reset person detection
+  person.detected = false;
+  person.x = 0.0f;
+  person.y = 0.0f;
+  
+  Serial.println("✅ Reset hoàn tất!");
+  Serial.printf("   Loop completed: %s\n", loopDetector.completed ? "TRUE ❌" : "FALSE ✅");
+  Serial.printf("   Nav state: %s\n", navState == NORMAL ? "NORMAL ✅" : "OTHER ❌");
+  Serial.printf("   Current cmd: %s\n", currentCmd == CMD_STOP ? "STOP ✅" : "OTHER");
+  Serial.printf("   Is turning: %s\n", isTurning ? "YES ❌" : "NO ✅");
+  Serial.println("🚗 Xe sẵn sàng chạy lại!\n");
+}
+
+void onWsEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+  if(type == WStype_CONNECTED) {
+    IPAddress ip = ws.remoteIP(num);
+    Serial.printf("[WS] Client #%d: %d.%d.%d.%d\n", num, ip[0], ip[1], ip[2], ip[3]);
+  }
+  
+  if(type == WStype_TEXT) {
+    String msg = String((char*)payload);
+    msg.trim();
+    
+    if(msg == "RESET") {
+      resetSystem();  // ⚡ GỌI HÀM RESET HOÀN CHỈNH
+      emitWS("RESET_OK");
+    }
+    else if(msg == "START") {
+      Serial.println("\n🚗 START command từ web...");
+      
+      // ⚡ ĐẢM BẢO RESET TRƯỚC KHI START
+      if(loopDetector.completed) {
+        Serial.println("⚠️ Phát hiện completed=true, đang reset...");
+        resetSystem();
+        delay(100);
+      }
+      
+      // Đặt lại state để xe bắt đầu chạy
+      navState = NORMAL;
+      isTurning = false;
+      currentCmd = CMD_STOP;
+      loopDetector.completed = false;  // ⚡ ĐẢM BẢO = FALSE
+      
+      Serial.println("✅ Xe bắt đầu chạy!");
+      Serial.printf("   Loop completed: %s\n", loopDetector.completed ? "TRUE ❌" : "FALSE ✅");
+    }
+    else if(msg == "FORCE_STOP") {
+      Serial.println("\n🛑 FORCE STOP từ web!");
+      loopDetector.completed = true;
+      stopCar();
+    }
+    else if(msg == "START_COVERAGE") {
+      Serial.println("\n🎯 START_COVERAGE command từ web...");
+      Serial.println("📨 WebSocket nhận được lệnh START_COVERAGE!");
+      startCoverageMode();
+    }
+    else if(msg == "STOP_COVERAGE") {
+      Serial.println("\n🛑 STOP_COVERAGE từ web!");
+      coverage.active = false;
+      navState = NORMAL;
+      stopCar();
+      emitWS("COVERAGE_STOPPED");
+    }
+  }
+}
+
+// ===== SETUP =====
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  Serial.println("\n==================================================");
+  Serial.println(" ESP32-C3 SERVER WITH PERSON DETECTION (FIXED)");
+  Serial.println("==================================================");
+
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+  pinMode(ENA, OUTPUT); pinMode(ENB, OUTPUT);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  pwmSetup();
+  stopCar();
+
+  // WiFi
+  Serial.print("\n📡 Connecting WiFi");
+  WiFi.begin(ssid, password);
+  int attempts = 0;
+  while(WiFi.status() != WL_CONNECTED && attempts < 30) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+
+  if(WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✅ WiFi OK!");
+    Serial.print("📍 IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\n❌ WiFi failed!");
+  }
+
+  // TCP server port 8080
+  tcpServer.begin();
+  Serial.println("🚀 TCP server: port 8080");
+
+  // Web server port 80
+  web.on("/", handleRoot);
+  web.begin();
+  Serial.println("🌐 Web server: port 80");
+
+  // WebSocket port 81
+  ws.begin();
+  ws.onEvent(onWsEvent);
+  Serial.println("🔌 WebSocket: port 81");
+
+  lastPoseMs = millis();
+  lastLRms = millis();
+  
+  // 🆕 RESET HOÀN TOÀN - ĐẢM BẢO THỨ TỰ ĐÚNG
+  pathHistory.clear();
+  loopDetector.completed = false;  // ⚡ PHẢI SET FALSE TRƯỚC
+  loopDetector.startTime = millis();
+  loopDetector.endTime = 0;
+  loopDetector.loopPerimeter = 0.0f;
+  loopDetector.loopCloseIndex = -1;
+  
+  // 🔧 ĐIỀU CHỈNH THAM SỐ (Đã set trong struct, không cần set lại)
+  Serial.println("\n✅ Loop detection configured:");
+  Serial.printf("   Ngưỡng đóng vòng: %.2fm\n", loopDetector.closureThreshold);
+  Serial.printf("   Khoảng cách tối thiểu: %.2fm\n", loopDetector.minTravelDistance);
+  Serial.printf("   Số điểm tối thiểu: %d\n", loopDetector.minPathLength);
+  Serial.printf("   Check interval: %d\n", loopDetector.checkInterval);
+  Serial.printf("   Skip recent: %d\n", loopDetector.skipRecent);
+  Serial.printf("   Completed: %s\n", loopDetector.completed ? "TRUE ❌ BUG!" : "FALSE ✅");
+  
+  Serial.println("\n✅ System ready!");
+  Serial.println("🚗 Robot is starting to move...");
+  Serial.println("==================================================\n");
+
+  // ⚡ THÊM DÒNG NÀY CUỐI SETUP():
+  Serial.println("\n⚡ Kiểm tra trạng thái ban đầu:");
+  Serial.printf("   Loop completed: %s\n", loopDetector.completed ? "TRUE ❌" : "FALSE ✅");
+  Serial.printf("   Nav state: %s\n", navState == NORMAL ? "NORMAL ✅" : "OTHER ❌");
+  
+  // ⚡ ĐẢM BẢO COMPLETED = FALSE
+  loopDetector.completed = false;
+  
+  Serial.println("\n✅ System ready!");
+  Serial.println("🚗 Robot is starting to move...");
+  Serial.println("==================================================\n");
+}
+
+
+
+// ===== LOOP =====
+void loop() {
+  web.handleClient();
+  ws.loop();
+
+  checkTCPClient();
+  receiveSensorData();
+  updatePose();
+  // 🆕 THÊM: Kiểm tra vòng kín
+  checkLoopCompletion();
+
+  // Read sensors & emit data every 100ms
+  if(millis() - lastSensorRead >= 100) {
+    distanceFront = (int)measureFrontDistance();
+    lastSensorRead = millis();
+
+    // Emit POSE
+    String poseMsg = "POSE," + String(x, 3) + "," + String(y, 3) + "," + String(th, 3);
+    emitWS(poseMsg);
+    
+    // 🆕 THÊM: Lưu path history
+    if(!loopDetector.completed && 
+       currentCmd == CMD_FWD && 
+       !isTurning && 
+       navState == NORMAL) {  // ⚡ THÊM: CHỈ lưu khi đang ở chế độ NORMAL
+      
+      // Kiểm tra khoảng cách với điểm cuối cùng
+      bool shouldSave = true;
+      if(!pathHistory.empty()) {
+        float dx = x - pathHistory.back().x;
+        float dy = y - pathHistory.back().y;
+        float dist = sqrtf(dx*dx + dy*dy);
+        
+        if(dist < MIN_PATH_DISTANCE) {
+          shouldSave = false;  // Quá gần điểm trước → không lưu
+        }
+      }
+      
+      if(shouldSave) {
+        pathHistory.push_back({x, y});
+        if(pathHistory.size() > MAX_PATH_SIZE) {
+          pathHistory.erase(pathHistory.begin());
+        }
+      }
+    }
+
+    // Emit RANGE
+    String rangeMsg = "RANGE," + String(distanceLeft) + "," + String(distanceRight) + "," + String(distanceFront);
+    emitWS(rangeMsg);
+
+    // Emit obstacles
+    if(!isTurning && distanceFront != 999) {
+      emitObstacle(distanceFront / 100.0f, aF, 'F');
+    }
+    
+    if(distanceLeft != 999 && distanceLeft <= 20) {
+      emitObstacle(distanceLeft / 100.0f, aL, 'L');
+    }
+
+    if(distanceRight != 999 && distanceRight <= 20) {
+      emitObstacle(distanceRight / 100.0f, aR, 'R');
+    }
+
+    // Debug print
+    Serial.printf("📏 F:%3d L:%3d R:%3d | x=%.2f y=%.2f th=%.2f | Person:%s (%.2f,%.2f)\n",
+                  distanceFront, distanceLeft, distanceRight, 
+                  x, y, th,
+                  person.detected ? "YES" : "NO",
+                  person.x, person.y);
+  }
+
+  // Navigation control
+  driveControl();
+
+  delay(10);
+}
